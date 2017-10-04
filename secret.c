@@ -38,7 +38,8 @@ static struct secret_dev {
 	struct cdev cdev;
 	struct completion comp;
 	spinlock_t lock;
-	struct list_head secrets; /* protected by lock */
+	struct list_head pending;	/* protected by lock */
+	struct list_head expired;	/* protected by lock */
 } *secret_devices;
 
 struct secret_file_pdata_read {
@@ -89,7 +90,7 @@ static void secret_on_timer(unsigned long entry_ul)
 		spin_unlock(&dev->lock);
 		return;
 	}
-	list_move(&entry->list, &dev->secrets);
+	list_move(&entry->list, &dev->expired);
 	spin_unlock(&dev->lock);
 
 	complete(&dev->comp);
@@ -122,8 +123,8 @@ static ssize_t secret_r_read(struct file *filp, char __user *buf,
 		spin_lock_bh(&dev->lock);
 
 		/* Extract data and free the entry */
-		entry_list = dev->secrets.next;
-		BUG_ON(entry_list == &dev->secrets);
+		entry_list = dev->expired.next;
+		BUG_ON(entry_list == &dev->expired);
 		entry = list_entry(entry_list, struct secret_entry, list);
 		list_del(entry_list);
 
@@ -218,7 +219,7 @@ static int secret_w_release(struct inode *inode, struct file *filp)
 
 	/* The timer function holds the spinlock too, use _bh */
 	spin_lock_bh(&dev->lock);
-	list_add_tail(&entry->list, &dev->secrets);
+	list_add_tail(&entry->list, &dev->pending);
 	spin_unlock_bh(&dev->lock);
 
 	init_timer(timer);
@@ -312,7 +313,8 @@ static void secret_device_init(struct secret_dev *dev, dev_t minor)
 	dev->timeout_ms = deftimeout_ms;
 	init_completion(&dev->comp);
 	spin_lock_init(&dev->lock);
-	INIT_LIST_HEAD(&dev->secrets);
+	INIT_LIST_HEAD(&dev->pending);
+	INIT_LIST_HEAD(&dev->expired);
 
 	dev->device = device_create(secret_class, NULL, devno, NULL,
 			"secret%d", (int) minor);
@@ -334,22 +336,19 @@ static void secret_device_init(struct secret_dev *dev, dev_t minor)
 
 static void secret_device_cleanup(struct secret_dev *dev, dev_t minor)
 {
-	struct list_head *curr;
+	struct list_head *curr, *next;
 	struct secret_entry *entry;
 	int cnt = 0;
 
 	cdev_del(&dev->cdev);
 
-	/*
-	 * At this point, all the opened files have been released, so we can
-	 * just delete the timers and entries one by one.
-	 */
+	/* Delete pending secrets */
 
 	while (1) {
 		spin_lock_bh(&dev->lock);
 
-		curr = dev->secrets.next;
-		if (curr == &dev->secrets) {
+		curr = dev->pending.next;
+		if (curr == &dev->pending) {
 			spin_unlock_bh(&dev->lock);
 			break;
 		}
@@ -370,6 +369,17 @@ static void secret_device_cleanup(struct secret_dev *dev, dev_t minor)
 
 	if (cnt)
 		dev_dbg(dev->device, "cleared out %d pending secrets\n", cnt);
+
+	cnt = 0;
+	list_for_each_safe(curr, next, &dev->expired) {
+		entry = list_entry(curr, struct secret_entry, list);
+		secret_text_free(entry->text);
+		kfree(entry);
+		++cnt;
+	}
+
+	if (cnt)
+		dev_dbg(dev->device, "cleared out %d expired secrets\n", cnt);
 
 	device_destroy(secret_class, MKDEV(major, minor));
 }
