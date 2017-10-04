@@ -90,7 +90,7 @@ static void secret_on_timer(unsigned long entry_ul)
 		spin_unlock(&dev->lock);
 		return;
 	}
-	list_move(&entry->list, &dev->expired);
+	list_move_tail(&entry->list, &dev->expired);
 	spin_unlock(&dev->lock);
 
 	complete(&dev->comp);
